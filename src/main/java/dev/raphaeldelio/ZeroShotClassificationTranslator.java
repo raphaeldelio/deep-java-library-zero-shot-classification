@@ -169,7 +169,7 @@ public class ZeroShotClassificationTranslator
             if (combinedLogits.getShape().get(1) == 2) {
                 // Binary classification: [not entail, entail]
                 NDArray probs = combinedLogits.softmax(1);
-                entailmentScores = probs.get(":, 0");
+                entailmentScores = probs.get(":, " + entailmentId);
             } else {
                 // 3-class NLI output (e.g., entailment, neutral, contradiction)
                 NDArray entailContrLogits = combinedLogits.get(new NDIndex(":, {}", manager.create(new int[]{contradictionId, entailmentId})));
