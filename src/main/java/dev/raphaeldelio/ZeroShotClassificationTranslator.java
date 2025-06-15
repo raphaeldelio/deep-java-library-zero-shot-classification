@@ -1,7 +1,6 @@
 package dev.raphaeldelio;
 
 import ai.djl.Model;
-import ai.djl.ModelException;
 import ai.djl.huggingface.tokenizers.Encoding;
 import ai.djl.huggingface.tokenizers.HuggingFaceTokenizer;
 import ai.djl.inference.Predictor;
@@ -13,16 +12,18 @@ import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.index.NDIndex;
 import ai.djl.translate.*;
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
+import ai.djl.util.JsonUtils;
+import ai.djl.util.Pair;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.lang.reflect.Type;
-import java.net.URL;
+import java.io.Reader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 
 public class ZeroShotClassificationTranslator
@@ -50,78 +51,56 @@ public class ZeroShotClassificationTranslator
         this.contradictionId = contradictionId;
     }
 
-    /**
-     * {@inheritDoc}
-     */
-    @SuppressWarnings({"unchecked"})
+    /** {@inheritDoc} */
     @Override
-    public void prepare(TranslatorContext ctx) throws IOException, ModelException {
+    public void prepare(TranslatorContext ctx) {
         Model model = ctx.getModel();
         predictor = model.newPredictor(new NoopTranslator(null));
         ctx.getPredictorManager().attachInternal(UUID.randomUUID().toString(), predictor);
 
-        URL configUrl = null;
-        try {
-            configUrl = model.getArtifact("config.json");
-        } catch (IOException e) {
-            logger.error("Error reading config.json of model: {}", model.getName(), e);
+        Path configFile = model.getModelPath().resolve("config.json");
+        if (!Files.isRegularFile(configFile)) {
+            return;
         }
-
-        if (configUrl != null) {
-            try (InputStream is = configUrl.openStream();
-                 InputStreamReader reader = new InputStreamReader(is)) {
-
-                Gson gson = new Gson();
-                Type type = new TypeToken<Map<String, Object>>() {
-                }.getType();
-                Map<String, Object> config = gson.fromJson(reader, type);
-
-                if (config != null) {
-                    if (config.containsKey("label2id")) {
-                        Map<String, Double> label2idDouble = (Map<String, Double>) config.get("label2id");
-                        Map<String, Integer> label2id = new HashMap<>();
-                        label2idDouble.forEach((k, v) -> label2id.put(k, v != null ? v.intValue() : null));
-
-
-                        for (Map.Entry<String, Integer> entry : label2id.entrySet()) {
-                            if (entry.getKey().toLowerCase().startsWith("entail") && entry.getValue() != null) {
-                                entailmentId = entry.getValue();
-                            } else if (entry.getKey().toLowerCase().startsWith("contra") && entry.getValue() != null) {
-                                contradictionId = entry.getValue();
-                            }
-                        }
+        try (Reader reader = Files.newBufferedReader(configFile)) {
+            JsonObject config = JsonUtils.GSON.fromJson(reader, JsonObject.class);
+            if (config.has("label2id")) {
+                JsonObject label2Id = config.getAsJsonObject("label2id");
+                    for (Map.Entry<String, JsonElement> entry : label2Id.entrySet()) {
+                    String key = entry.getKey().toLowerCase(Locale.ROOT);
+                    int value = entry.getValue().getAsInt();
+                    if (key.startsWith("entail")) {
+                        entailmentId = value;
+                    } else if (key.startsWith("contra")) {
+                        contradictionId = value;
                     }
-
-                    boolean inferredWithTokenType = false; // Default assumption
-
-                    if (config.containsKey("type_vocab_size")) {
-                        Object typeVocabSizeObj = config.get("type_vocab_size");
-                        if (typeVocabSizeObj instanceof Number) {
-                            int typeVocabSize = ((Number) typeVocabSizeObj).intValue();
-                            if (typeVocabSize > 1) {
-                                inferredWithTokenType = true;
-                            }
-                        }
-                    }
-
-                    if (!inferredWithTokenType && config.containsKey("model_type")) {
-                        String modelType = (String) config.get("model_type");
-                        if (modelType != null) {
-                            // Use .equals() or .startsWith() for precise matching, avoiding false positives like "roberta" containing "bert"
-                            if (modelType.equals("bert")
-                                    || modelType.equals("albert")
-                                    || modelType.equals("xlnet")
-                                    || modelType.startsWith("deberta")) { // Covers "deberta" and "deberta-v2"
-                                inferredWithTokenType = true;
-                            }
-                        }
-                    }
-
-                    tokenTypeId = inferredWithTokenType;
                 }
-            } catch (Exception e) {
-                System.err.println("Failed to read or parse config.json for label2id: " + e.getMessage());
             }
+
+            boolean inferredWithTokenType = false; // Default assumption
+            if (config.has("type_vocab_size")) {
+                JsonElement typeVocabSizeObj = config.get("type_vocab_size");
+                if (typeVocabSizeObj.isJsonPrimitive()) {
+                    int typeVocabSize = typeVocabSizeObj.getAsInt();
+                    if (typeVocabSize > 1) {
+                        inferredWithTokenType = true;
+                    }
+                }
+            }
+
+            if (!inferredWithTokenType && config.has("model_type")) {
+                String modelType = config.get("model_type").getAsString().toLowerCase(Locale.ROOT);
+                if ("bert".equals(modelType)
+                        || "albert".equals(modelType)
+                        || "xlnet".equals(modelType)
+                        || modelType.startsWith("deberta")) {
+                    inferredWithTokenType = true;
+                }
+            }
+
+            tokenTypeId = inferredWithTokenType;
+        } catch (IOException | JsonParseException e) {
+            logger.error("Failed to read or parse config.json for label2id", e);
         }
     }
 
@@ -134,9 +113,7 @@ public class ZeroShotClassificationTranslator
         return new NDList();
     }
 
-    /**
-     * {@inheritDoc}
-     */
+    /** {@inheritDoc} */
     @Override
     public ZeroShotClassificationOutput processOutput(TranslatorContext ctx, NDList list)
             throws TranslateException {
@@ -155,8 +132,8 @@ public class ZeroShotClassificationTranslator
             String hypothesis = applyTemplate(template, candidate);
             Encoding encoding = tokenizer.encode(input.getText(), hypothesis);
             NDList in = encoding.toNDList(manager, tokenTypeId, int32);
-            NDList batch = Batchifier.STACK.batchify(new NDList[]{in});
-            output.add(predictor.predict(batch).get(0));
+            NDList batch = Batchifier.STACK.batchify(new NDList[] {in});
+            output.add(predictor.predict(batch).getFirst());
         }
 
         NDArray combinedLogits = NDArrays.concat(output);
@@ -172,23 +149,24 @@ public class ZeroShotClassificationTranslator
                 entailmentScores = probs.get(":, " + entailmentId);
             } else {
                 // 3-class NLI output (e.g., entailment, neutral, contradiction)
-                NDArray entailContrLogits = combinedLogits.get(new NDIndex(":, {}", manager.create(new int[]{contradictionId, entailmentId})));
+                NDArray entailContrLogits =
+                        combinedLogits.get(
+                                new NDIndex(
+                                        ":, {}",
+                                        manager.create(new int[] {contradictionId, entailmentId})));
                 NDArray scoresProbs = entailContrLogits.softmax(1);
                 entailmentScores = scoresProbs.get(":, 1");
             }
 
             float[] floatScores = entailmentScores.toFloatArray();
-            double[] tempScores = new double[floatScores.length];
+
+            List<Pair<Double, String>> pairs = new ArrayList<>();
             for (int i = 0; i < floatScores.length; i++) {
-                tempScores[i] = floatScores[i];
+                Pair<Double, String> pair = new Pair<>((double) floatScores[i], candidates[i]);
+                pairs.add(pair);
             }
-
-            List<AbstractMap.SimpleEntry<Double, String>> pairs = new ArrayList<>();
-            for (int i = 0; i < candidates.length; i++) {
-                pairs.add(new AbstractMap.SimpleEntry<>(tempScores[i], candidates[i]));
-            }
-
-            pairs.sort(Comparator.comparingDouble((AbstractMap.SimpleEntry<Double, String> e) -> e.getKey()).reversed());
+            pairs.sort(
+                    Comparator.comparingDouble((Pair<Double, String> e) -> e.getKey()).reversed());
 
             finalLabels = new String[candidates.length];
             finalScores = new double[candidates.length];
@@ -196,7 +174,6 @@ public class ZeroShotClassificationTranslator
                 finalLabels[i] = pairs.get(i).getValue();
                 finalScores[i] = pairs.get(i).getKey();
             }
-
         } else { // Single-label classification (len(candidate_labels) > 1 and not multi_label)
             NDArray entailLogits = combinedLogits.get(":, " + entailmentId);
             NDArray exp = entailLogits.exp();
@@ -320,9 +297,8 @@ public class ZeroShotClassificationTranslator
          * Builds the translator.
          *
          * @return the new translator
-         * @throws IOException if I/O error occurs
          */
-        public ZeroShotClassificationTranslator build() throws IOException {
+        public ZeroShotClassificationTranslator build() {
             return new ZeroShotClassificationTranslator(tokenizer, tokenTypeId, int32, entailmentId, contradictionId);
         }
     }
